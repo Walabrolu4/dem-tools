@@ -6,12 +6,28 @@ See [docs.md](docs.md) for a detailed technical explanation of how the script wo
 
 ## WSL setup
 
-Requires Python 3 with the following packages: `rasterio`, `numpy`, `matplotlib`.
+Requires Python 3 with the following packages: `rasterio`, `numpy`, `matplotlib`. `fetch_satellite.py` (see below) additionally needs `contextily`.
 
 ```bash
 cd dem-to-grid
-pip install rasterio numpy matplotlib
+pip install rasterio numpy matplotlib contextily
 ```
+
+## Fetching a matching satellite image
+
+If you don't already have a reference image for `--preview-image`/`--export-texture`, `fetch_satellite.py` downloads one for you, pre-aligned to a DEM's exact bounds and CRS — no manual bounding-box matching needed:
+
+```bash
+python3 fetch_satellite.py terrain_dem.tif terrain_satellite.tif
+```
+
+This fetches Esri World Imagery tiles (free, no API key) covering the DEM's bounding box, reprojects them onto a raster with the DEM's own bounds/CRS, and saves a GeoTIFF you can pass straight to `--preview-image`. Options:
+
+- `--scale` (default `3.0`): output resolution as a multiple of the DEM's own pixel dimensions
+- `--zoom`: tile zoom level (default: auto-selected)
+- `--provider`: dotted contextily provider name (default `Esri.WorldImagery`)
+
+Requires internet access to the tile server at runtime.
 
 ## Usage
 

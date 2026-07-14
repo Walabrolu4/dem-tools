@@ -159,3 +159,16 @@ All validation happens up front in `validate_args` before any raster I/O, so bad
 - `--preview-image` alignment assumes both rasters share the same CRS; there's no reprojection step, so mismatched CRSs will silently misalign the overlay.
 - Center-cropping discards DEM margin outside the largest cell-fitting extent; there's no option to pad instead of crop.
 - `--row-spacing`/`--col-spacing` only capture a single fixed aspect ratio; a physical grid with non-uniform pitch (spacing that varies cell-to-cell) isn't representable.
+
+## `fetch_satellite.py`
+
+A separate, standalone script (not imported by `process_dem.py`) that solves the "I need a `--preview-image` but don't have one" problem: given a DEM, it downloads satellite tiles covering that exact bounding box and writes them out already aligned to the DEM's CRS, so there's no manual bounding-box matching to get wrong.
+
+- Reads the DEM's `bounds` and `crs` via `rasterio` (does not touch pixel data).
+- `contextily.bounds2img(..., ll=True)` fetches an XYZ tile mosaic (default provider `Esri.WorldImagery`) covering those bounds. `ll=True` tells contextily the input bounds are lon/lat (EPSG:4326); it internally reprojects to the tile servers' native Web Mercator (EPSG:3857) to select tiles, and returns the mosaic as an `(H, W, 4)` RGBA array plus its extent *in EPSG:3857*.
+- Because that mosaic is in Web Mercator, not the DEM's CRS, it's reprojected band-by-band with `rasterio.warp.reproject` onto a destination array whose `transform` is built directly from the DEM's own `bounds` (`rasterio.transform.from_bounds`) — this is what guarantees the output lines up pixel-for-pixel with `process_dem.py`'s coordinate-alignment logic (`dem_px_to_bg_px` in `save_preview`/`export_cropped_texture`), which assumes the background raster shares the DEM's CRS.
+- Output resolution is independent of the DEM's own pixel size — `--scale` (default `3.0`) multiplies the DEM's width/height to get a higher-detail texture from the same bounds.
+- `--zoom` controls how much detail is requested from the tile server itself (higher = more source tiles = slower fetch, sharper before the final resample); left as `"auto"` by default, which lets contextily pick based on the requested bounds.
+- `--provider` resolves a dotted name (e.g. `Esri.WorldImagery`) against `contextily.providers` via chained `getattr`, so any provider contextily knows about can be used, not just the default.
+
+Needs live internet access to the tile server when run; there's no offline/cached fallback.
