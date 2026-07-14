@@ -1,0 +1,5 @@
+*.bin
+*.csv
+*.png
+*_metadata.json
+__pycache__/
