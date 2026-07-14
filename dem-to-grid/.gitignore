@@ -2,3 +2,4 @@
 *.png
 *.tif
 __pycache__/
+run_grid_template.txt
