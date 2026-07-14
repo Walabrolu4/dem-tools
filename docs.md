@@ -1,0 +1,154 @@
+# process_dem.py — Technical Documentation
+
+This document explains what `process_dem.py` does internally, function by function, for anyone maintaining or extending it. For install/usage instructions, see [README.md](README.md).
+
+## Purpose
+
+Takes a DEM (Digital Elevation Model) GeoTIFF and reduces it to a small `rows x columns` grid of height values, scaled to a target range (e.g. millimeters for a physical relief model). The grid is meant to drive a device that raises/lowers a fixed-size array of cells (e.g. pins under a projector), so:
+
+- every output cell must represent a real-world **square** patch of ground, regardless of the DEM's aspect ratio or pixel resolution
+- the number of rows/columns is fixed by the physical device, not by the DEM's shape
+
+## Pipeline overview
+
+`main()` runs these steps in order:
+
+1. **Read** the DEM's first band and its geospatial metadata (`read_dem`)
+2. **Crop** the DEM so its extent divides evenly into square cells (`crop_to_square_cells`)
+3. **Average** each cell's source pixels (`average_to_grid`)
+4. **Remap** averaged elevations to the target height range (`remap_range`)
+5. **Round** to a step size, if requested (`round_to_step`)
+6. **Print** the grid to the console, and optionally **save** it (`save_csv` / `save_json`), render a **preview** image (`save_preview`), and/or export a matching **cropped texture** (`export_cropped_texture`)
+
+## Function reference
+
+### `read_dem(path) -> (band, xres, yres, is_geographic, transform)`
+
+Opens the GeoTIFF with `rasterio` and reads band 1 as a `numpy.ma.MaskedArray`, using `masked=True` so nodata pixels (per the raster's nodata tag) are masked. `np.ma.masked_invalid` additionally masks any `NaN`/`Inf` values, since some float DEMs use those instead of a nodata tag.
+
+Also returns:
+- `xres, yres`: pixel size in CRS units (`dataset.res`)
+- `is_geographic`: `True` if the CRS is in degrees (e.g. EPSG:4326) rather than a projected, linear-unit CRS (e.g. UTM/meters)
+- `transform`: the raster's affine geotransform (pixel → world coordinates), needed later to align preview overlays
+
+### `read_display_image(path) -> (array, transform)`
+
+Like `read_dem`, but for loading a *different* image as a preview background (e.g. an orthophoto). Returns a 2D grayscale array (single-band raster) or an `(H, W, bands)` array (multi-band, up to 4 bands — RGB or RGBA) suitable for `matplotlib.imshow`, plus its geotransform.
+
+### `crop_to_square_cells(band, xres, yres, rows, columns) -> (cropped_band, cell_size, row_start, col_start)`
+
+This is the core of the "square cells" requirement. Given a fixed `rows x columns` grid, the DEM's real-world extent (`width * xres`, `height * yres`) generally won't divide into that many *square* cells — the extent's aspect ratio rarely matches `columns / rows` exactly.
+
+The fix: pick the largest square cell side (`cell_size`) that fits within *both* axes —
+
+```python
+cell_size = min(real_width / columns, real_height / rows)
+```
+
+— then compute how many source pixels that implies along each axis (`cell_size * columns / xres` and `cell_size * rows / yres`), and **center-crop** the DEM down to exactly that many pixels, discarding any excess margin evenly from both sides of the longer axis. The result: every one of the `rows x columns` cells covers an equal-area square on the ground.
+
+Returns the cropped array, the resulting cell side length (in CRS units), and the pixel offset of the crop within the original (uncropped) band — the offset is needed later to draw the crop boundary on a preview of the full DEM.
+
+**Caveat:** if the DEM's CRS is geographic (degrees), "square" here means square in *degrees*, not true ground meters, since a degree of longitude covers a different ground distance than a degree of latitude (except at the equator). `main()` prints a warning in this case. For physically accurate squares, reproject the DEM to a projected CRS first (e.g. `gdalwarp -t_srs EPSG:32633 in.tif out.tif`).
+
+### `block_edges(source_size, num_blocks) -> np.ndarray`
+
+```python
+np.round(np.linspace(0, source_size, num_blocks + 1)).astype(int)
+```
+
+Splits a pixel dimension of length `source_size` into `num_blocks` contiguous chunks of nearly-equal size, returning the `num_blocks + 1` integer boundary indices. Because the boundaries are computed as evenly-spaced floats and then rounded independently, this works for *any* ratio of `source_size` to `num_blocks` — including cases that don't divide evenly, and cases where `num_blocks` exceeds `source_size` (in which case some blocks end up empty; see `average_to_grid`).
+
+Used both for slicing the DEM into averaging blocks and for drawing grid lines in the preview.
+
+### `average_to_grid(band, rows, columns) -> np.ndarray`
+
+For each of the `rows x columns` output cells, slices the corresponding block of the (cropped) DEM using `block_edges` on both axes, and takes `np.ma.mean` over the unmasked pixels in that block. If a block has zero unmasked pixels (e.g. it's entirely nodata, or the grid is finer than the source resolution so a block is empty), the cell is set to `NaN` instead of raising an error.
+
+### `remap_range(values, source_min, source_max, target_min, target_max) -> np.ndarray`
+
+Standard linear remap:
+
+```python
+scale = (target_max - target_min) / (source_max - source_min)
+remapped = target_min + (values - source_min) * scale
+```
+
+Output is then clamped to `[target_min, target_max]` — this matters when `--source-min`/`--source-max` are supplied manually and don't actually bound the DEM's real values, which would otherwise push some cells outside the intended target range. `NaN` inputs stay `NaN`.
+
+### `round_to_step(values, step) -> np.ndarray`
+
+```python
+np.round(values / step) * step
+```
+
+Snaps each value to the nearest multiple of `step` (e.g. `step=5`: `191.6 -> 190`, `193.2 -> 195`). `NaN` is preserved (rounding a NaN yields NaN). Applied after remapping, if `--round-to` is given.
+
+### `determine_source_range(band, source_min, source_max) -> (float, float)`
+
+If both `--source-min` and `--source-max` are given, they're used as-is (useful for keeping a consistent scale across multiple DEM tiles processed independently). Otherwise, both are computed from the DEM's own valid (unmasked) pixel values via `np.ma.min`/`np.ma.max`. Raises if the DEM has no valid pixels at all. Note `validate_args` requires the two flags to be given together — a partial override isn't allowed, since a lopsided source range would silently skew the remap.
+
+### `format_grid(grid) -> str`
+
+Console rendering: comma-separated rows, values to 2 decimal places, `NaN` cells shown as the literal string `nan`.
+
+### `save_csv` / `save_json`
+
+Write the grid to disk. CSV: one row per line, values to 4 decimal places, `NaN` cells written as an empty field. JSON: nested list of lists, `NaN` cells become `null`, values rounded to 4 decimal places.
+
+### `export_cropped_texture(background, background_transform, dem_transform, crop_row_start, crop_col_start, crop_height, crop_width, path)`
+
+Crops a background image (`--preview-image`, or the DEM itself as a fallback) down to exactly the square footprint that `crop_to_square_cells` computed for the grid, and saves it as a plain `.png`/`.jpg`/`.jpeg` — no geospatial metadata, just pixels. The intent is a texture asset that a renderer can lay over the physical model in exact alignment with the height grid, since both were cropped to the same real-world square.
+
+Uses the same `dem_px_to_bg_px` coordinate conversion as `save_preview` (DEM pixel → world via `dem_transform` → background pixel via the inverse of `background_transform`) to convert the crop's four corners into the background image's pixel space, then takes the axis-aligned bounding box of those corners, clamped to the background image's actual bounds, and slices it out with plain NumPy indexing. Raises `ValueError` if that bounding box is empty (e.g. the DEM and background don't actually overlap in world coordinates — likely a CRS mismatch or unrelated images).
+
+Written with `matplotlib.pyplot.imsave`: 2D (grayscale DEM fallback) arrays are colormapped with `"gray"`; multi-band arrays are written as-is (RGB/RGBA).
+
+### `save_preview(...)`
+
+Renders a PNG/JPG/PDF/SVG (matplotlib, `Agg` backend — no display required) showing:
+
+- the background image (the DEM itself in grayscale, or a `--preview-image` raster in its natural colors)
+- a red polygon marking the crop boundary computed by `crop_to_square_cells`
+- each grid cell drawn as a semi-transparent, `viridis`-colored polygon (color = its remapped height, via `Normalize(target_min, target_max)`), outlined in yellow
+- the cell's rounded value as centered text (white with a black outline, for legibility over any background color)
+- cells that are `NaN` are hatched instead of colored
+- a colorbar keyed to the same `Normalize` range, labeled with `--units`
+
+**Coordinate alignment.** The crop boundary and grid cell edges are computed in the *DEM's* pixel space (from `crop_to_square_cells` and `block_edges`). To draw them on a background image that may have a different resolution, extent, or pixel grid (e.g. an orthophoto covering a larger or differently-sampled area), each DEM pixel coordinate is converted to world coordinates via the DEM's affine transform, then to the background image's pixel space via the *inverse* of the background's affine transform:
+
+```python
+def dem_px_to_bg_px(col, row):
+    x, y = dem_transform * (col, row)       # DEM pixel -> world (CRS units)
+    return (~background_transform) * (x, y)  # world -> background pixel
+```
+
+This only produces a correct overlay if the DEM and the background image share the same CRS. (Affine transforms preserve straight lines, so grid lines and the crop rectangle remain straight after conversion even without assuming both rasters are axis-aligned the same way — the code draws each edge as a line between two converted endpoints rather than assuming a simple rectangle.)
+
+## CLI reference
+
+| Flag | Required | Description |
+|---|---|---|
+| `input` | yes | Path to the input DEM `.tif` |
+| `--rows` | yes | Number of output grid rows |
+| `--columns` | yes | Number of output grid columns |
+| `--target-min` / `--target-max` | yes | Output height range (e.g. `0` / `300` for mm) |
+| `--source-min` / `--source-max` | no | Fix the source elevation range instead of auto-detecting from the DEM; must be given together |
+| `--output` | no | Save the grid to `.csv` or `.json` |
+| `--round-to` | no | Snap remapped values to the nearest multiple of this number |
+| `--preview` | no | Save a `.png`/`.jpg`/`.jpeg`/`.pdf`/`.svg` visualization of the grid |
+| `--preview-image` | no | Use a different georeferenced raster as the preview background instead of the DEM (same CRS required); also used as the source for `--export-texture` |
+| `--units` | no | Unit label for `--preview` cell text/colorbar (default `mm`; pass `""` for none) |
+| `--export-texture` | no | Save a `.png`/`.jpg`/`.jpeg` crop of `--preview-image` (or the DEM) matching the grid's square footprint exactly |
+
+All validation happens up front in `validate_args` before any raster I/O, so bad arguments fail fast with a specific message (e.g. `--rows and --columns must be positive integers`, `--source-min and --source-max must be provided together`).
+
+## Error handling
+
+`main()` wraps the whole pipeline in a single `try/except Exception`, printing `Error: <message>` to stderr and exiting with status 1 on any failure (missing file, invalid args, empty DEM, etc.) — there's no partial/silent output on error.
+
+## Known limitations
+
+- Square-cell sizing assumes the CRS's linear units are consistent across both axes; for geographic CRSs a warning is printed but the script still proceeds using degree-based squares (see `crop_to_square_cells` above).
+- `--preview-image` alignment assumes both rasters share the same CRS; there's no reprojection step, so mismatched CRSs will silently misalign the overlay.
+- Center-cropping discards DEM margin outside the largest square-fitting extent; there's no option to pad instead of crop.

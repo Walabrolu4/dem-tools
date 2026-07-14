@@ -2,6 +2,8 @@
 
 Reduce a DEM GeoTIFF into a small grid of averaged, height-remapped values.
 
+See [docs.md](docs.md) for a detailed technical explanation of how the script works internally.
+
 ## WSL setup
 
 Requires Python 3 with the following packages: `rasterio`, `numpy`, `matplotlib`.
@@ -61,6 +63,17 @@ python3 process_dem.py terrain_dem.tif --rows 8 --columns 12 \
 ```
 
 The unit label appended to each cell's value and the colorbar defaults to `mm`; override with `--units` (e.g. `--units cm`, or `--units ""` for none).
+
+## Texture export
+
+Save a cropped copy of `--preview-image` (or the DEM itself, if `--preview-image` isn't given), trimmed to exactly the same square-cell footprint used for the grid, with `--export-texture`. This lets a renderer map the texture and the height grid onto the physical model in perfect alignment:
+
+```bash
+python3 process_dem.py terrain_dem.tif --rows 8 --columns 12 \
+  --target-min 0 --target-max 300 --preview-image terrain_photo.tif --export-texture texture.png
+```
+
+Output is a plain `.png`/`.jpg`/`.jpeg` (no geospatial metadata) — just the pixels inside the same square region shown by the red boundary in `--preview`.
 
 ## Square cells
 

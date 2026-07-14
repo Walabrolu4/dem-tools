@@ -173,6 +173,65 @@ def save_json(grid: np.ndarray, path: Path) -> None:
         json.dump(data, f, indent=2)
 
 
+def export_cropped_texture(
+    background: np.ndarray,
+    background_transform: "rasterio.Affine",
+    dem_transform: "rasterio.Affine",
+    crop_row_start: int,
+    crop_col_start: int,
+    crop_height: int,
+    crop_width: int,
+    path: Path,
+) -> None:
+    """Crop a background image (an orthophoto from --preview-image, or the
+    DEM itself) down to exactly the square-cell footprint used for the grid
+    (as computed by crop_to_square_cells), and save it as a plain image file.
+
+    This lets the same square region processed into the height grid also be
+    exported as a texture, so a renderer can map the two onto the physical
+    model in alignment. Like save_preview, coordinates are converted from the
+    DEM's pixel space to the background image's pixel space via each
+    raster's geotransform, so this works even if the background has a
+    different resolution or extent than the DEM (same CRS required)."""
+
+    def dem_px_to_bg_px(col: float, row: float) -> tuple[float, float]:
+        x, y = dem_transform * (col, row)
+        return (~background_transform) * (x, y)
+
+    corners_dem = [
+        (crop_col_start, crop_row_start),
+        (crop_col_start + crop_width, crop_row_start),
+        (crop_col_start + crop_width, crop_row_start + crop_height),
+        (crop_col_start, crop_row_start + crop_height),
+    ]
+    corners_bg = [dem_px_to_bg_px(col, row) for col, row in corners_dem]
+    xs = [c[0] for c in corners_bg]
+    ys = [c[1] for c in corners_bg]
+
+    bg_height, bg_width = background.shape[0], background.shape[1]
+    col0 = max(0, int(round(min(xs))))
+    col1 = min(bg_width, int(round(max(xs))))
+    row0 = max(0, int(round(min(ys))))
+    row1 = min(bg_height, int(round(max(ys))))
+
+    if col1 <= col0 or row1 <= row0:
+        raise ValueError(
+            "Computed texture crop is empty — the DEM and the texture image may not overlap in world coordinates"
+        )
+
+    cropped = background[row0:row1, col0:col1]
+
+    import matplotlib
+
+    matplotlib.use("Agg")  # no display available under WSL
+    import matplotlib.pyplot as plt
+
+    if cropped.ndim == 2:
+        plt.imsave(path, cropped, cmap="gray")
+    else:
+        plt.imsave(path, cropped)
+
+
 def save_preview(
     background: np.ndarray,
     background_transform: "rasterio.Affine",
@@ -306,6 +365,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--round-to must be a positive number")
     if args.preview is not None and args.preview.suffix.lower() not in (".png", ".jpg", ".jpeg", ".pdf", ".svg"):
         raise ValueError("--preview must end in .png, .jpg, .jpeg, .pdf, or .svg")
+    if args.export_texture is not None and args.export_texture.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+        raise ValueError("--export-texture must end in .png, .jpg, or .jpeg")
 
 
 def parse_args() -> argparse.Namespace:
@@ -341,6 +402,14 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to a different georeferenced image (e.g. an orthophoto) "
         "to draw the --preview overlay on top of, instead of the DEM itself. "
         "Must share the same CRS as the input DEM.",
+    )
+    parser.add_argument(
+        "--export-texture",
+        type=Path,
+        default=None,
+        help="Optional image path (.png/.jpg/.jpeg) to save a cropped copy of --preview-image "
+        "(or the DEM itself, if not given) matching exactly the square-cell footprint used "
+        "for the grid, for use as an aligned texture on the physical model",
     )
     parser.add_argument(
         "--units",
@@ -405,7 +474,7 @@ def main() -> None:
                 save_json(remapped, args.output)
             print(f"\nSaved grid to {args.output}")
 
-        if args.preview is not None:
+        if args.preview is not None or args.export_texture is not None:
             if args.preview_image is not None:
                 if not args.preview_image.exists():
                     raise FileNotFoundError(f"Preview image not found: {args.preview_image}")
@@ -414,21 +483,35 @@ def main() -> None:
                 background = original_band.astype(float).filled(np.nan)
                 background_transform = dem_transform
 
-            save_preview(
-                background,
-                background_transform,
-                dem_transform,
-                crop_row_start,
-                crop_col_start,
-                band.shape[0],
-                band.shape[1],
-                remapped,
-                args.target_min,
-                args.target_max,
-                args.units,
-                args.preview,
-            )
-            print(f"Saved preview to {args.preview}")
+            if args.preview is not None:
+                save_preview(
+                    background,
+                    background_transform,
+                    dem_transform,
+                    crop_row_start,
+                    crop_col_start,
+                    band.shape[0],
+                    band.shape[1],
+                    remapped,
+                    args.target_min,
+                    args.target_max,
+                    args.units,
+                    args.preview,
+                )
+                print(f"Saved preview to {args.preview}")
+
+            if args.export_texture is not None:
+                export_cropped_texture(
+                    background,
+                    background_transform,
+                    dem_transform,
+                    crop_row_start,
+                    crop_col_start,
+                    band.shape[0],
+                    band.shape[1],
+                    args.export_texture,
+                )
+                print(f"Saved cropped texture to {args.export_texture}")
 
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
