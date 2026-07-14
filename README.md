@@ -48,7 +48,7 @@ python3 process_dem.py terrain.tif --rows 6 --columns 10 \
 
 ## Preview
 
-Save an image showing the square-cell grid overlaid on the DEM: each cell is tinted by a color scale based on its remapped height, labeled with its value, with a color-key colorbar and the crop boundary (red) — so the grid can be sanity-checked visually before running it on the physical platform:
+Save an image showing the grid overlaid on the DEM: each cell is tinted by a color scale based on its remapped height, labeled with its value, with a color-key colorbar and the crop boundary (red) — so the grid can be sanity-checked visually before running it on the physical platform:
 
 ```bash
 python3 process_dem.py terrain.tif --rows 8 --columns 12 \
@@ -66,22 +66,30 @@ The unit label appended to each cell's value and the colorbar defaults to `mm`; 
 
 ## Texture export
 
-Save a cropped copy of `--preview-image` (or the DEM itself, if `--preview-image` isn't given), trimmed to exactly the same square-cell footprint used for the grid, with `--export-texture`. This lets a renderer map the texture and the height grid onto the physical model in perfect alignment:
+Save a cropped copy of `--preview-image` (or the DEM itself, if `--preview-image` isn't given), trimmed to exactly the same crop footprint used for the grid, with `--export-texture`. This lets a renderer map the texture and the height grid onto the physical model in perfect alignment:
 
 ```bash
 python3 process_dem.py terrain_dem.tif --rows 8 --columns 12 \
   --target-min 0 --target-max 300 --preview-image terrain_photo.tif --export-texture texture.png
 ```
 
-Output is a plain `.png`/`.jpg`/`.jpeg` (no geospatial metadata) — just the pixels inside the same square region shown by the red boundary in `--preview`.
+Output is a plain `.png`/`.jpg`/`.jpeg` (no geospatial metadata) — just the pixels inside the same region shown by the red boundary in `--preview`.
 
-## Square cells
+## Square (or rectangular) cells
 
-`--rows`/`--columns` describe a fixed physical display grid (e.g. a pin/actuator array under a projector). Since the DEM's pixel resolution and aspect ratio can differ from that grid, the script automatically **center-crops** the DEM before averaging so every output cell corresponds to a real-world **square** patch of terrain, rather than a rectangle stretched to fit:
+`--rows`/`--columns` describe a fixed physical display grid (e.g. a pin/actuator array under a projector). Since the DEM's pixel resolution and aspect ratio can differ from that grid, the script automatically **center-crops** the DEM before averaging so every output cell corresponds to a real-world patch of terrain of the correct shape, rather than a rectangle stretched to fit:
 
-- It computes the largest square cell size that fits within the DEM's real-world extent (using the raster's pixel resolution), then crops off any excess margin evenly from both sides of the longer axis.
-- If the crop changes the DEM's dimensions, a line is printed reporting the original/cropped pixel sizes and the resulting cell size.
-- If the DEM's CRS is **geographic** (degrees, e.g. EPSG:4326) rather than **projected** (meters, e.g. UTM), a warning is printed: cells will be square in degrees, not true ground meters, because a degree of longitude and a degree of latitude cover different distances. Reproject the DEM to a projected CRS (e.g. `gdalwarp -t_srs EPSG:32633 in.tif out.tif`) for physically accurate squares.
+- By default (no spacing flags) each cell is **square**: the script computes the largest square cell size that fits within the DEM's real-world extent (using the raster's pixel resolution), then crops off any excess margin evenly from both sides of the longer axis.
+- If your physical grid's cells *aren't* square — e.g. a peg/pipe array with different spacing along each axis — pass `--row-spacing` and `--col-spacing` (any consistent unit, only their ratio matters) to make the crop match that real aspect ratio instead of forcing 1:1. For example, a grid of pegs spaced 1.75in apart along the rows and 2.5in apart along the columns:
+
+  ```bash
+  python3 process_dem.py terrain.tif --rows 10 --columns 12 \
+    --target-min 0 --target-max 300 --row-spacing 1.75 --col-spacing 2.5
+  ```
+
+  Both flags must be given together; omitting both keeps the default square-cell behavior.
+- If the crop changes the DEM's dimensions, a line is printed reporting the original/cropped pixel sizes and the resulting cell size (or width x height, for rectangular cells).
+- If the DEM's CRS is **geographic** (degrees, e.g. EPSG:4326) rather than **projected** (meters, e.g. UTM), a warning is printed: cells will be sized in degrees, not true ground meters, because a degree of longitude and a degree of latitude cover different distances. Reproject the DEM to a projected CRS (e.g. `gdalwarp -t_srs EPSG:32633 in.tif out.tif`) for physically accurate cell dimensions.
 
 Notes:
 - Grid cells with no valid (non-nodata) source pixels are output as `NaN` / empty CSV cells / `null` in JSON.

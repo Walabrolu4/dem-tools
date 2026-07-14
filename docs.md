@@ -4,9 +4,9 @@ This document explains what `process_dem.py` does internally, function by functi
 
 ## Purpose
 
-Takes a DEM (Digital Elevation Model) GeoTIFF and reduces it to a small `rows x columns` grid of height values, scaled to a target range (e.g. millimeters for a physical relief model). The grid is meant to drive a device that raises/lowers a fixed-size array of cells (e.g. pins under a projector), so:
+Takes a DEM (Digital Elevation Model) GeoTIFF and reduces it to a small `rows x columns` grid of height values, scaled to a target range (e.g. millimeters for a physical relief model). The grid is meant to drive a device that raises/lowers a fixed-size array of cells (e.g. pins under a projector, or pegs on a physical rig), so:
 
-- every output cell must represent a real-world **square** patch of ground, regardless of the DEM's aspect ratio or pixel resolution
+- every output cell must represent a real-world patch of ground of the correct **shape** — square by default, or a fixed rectangular aspect ratio if the physical grid's cell pitch isn't equal on both axes — regardless of the DEM's aspect ratio or pixel resolution
 - the number of rows/columns is fixed by the physical device, not by the DEM's shape
 
 ## Pipeline overview
@@ -14,7 +14,7 @@ Takes a DEM (Digital Elevation Model) GeoTIFF and reduces it to a small `rows x 
 `main()` runs these steps in order:
 
 1. **Read** the DEM's first band and its geospatial metadata (`read_dem`)
-2. **Crop** the DEM so its extent divides evenly into square cells (`crop_to_square_cells`)
+2. **Crop** the DEM so its extent divides evenly into fixed-aspect-ratio cells (`crop_to_fixed_aspect_cells`)
 3. **Average** each cell's source pixels (`average_to_grid`)
 4. **Remap** averaged elevations to the target height range (`remap_range`)
 5. **Round** to a step size, if requested (`round_to_step`)
@@ -35,21 +35,26 @@ Also returns:
 
 Like `read_dem`, but for loading a *different* image as a preview background (e.g. an orthophoto). Returns a 2D grayscale array (single-band raster) or an `(H, W, bands)` array (multi-band, up to 4 bands — RGB or RGBA) suitable for `matplotlib.imshow`, plus its geotransform.
 
-### `crop_to_square_cells(band, xres, yres, rows, columns) -> (cropped_band, cell_size, row_start, col_start)`
+### `crop_to_fixed_aspect_cells(band, xres, yres, rows, columns, cell_aspect=1.0) -> (cropped_band, cell_width, cell_height, row_start, col_start)`
 
-This is the core of the "square cells" requirement. Given a fixed `rows x columns` grid, the DEM's real-world extent (`width * xres`, `height * yres`) generally won't divide into that many *square* cells — the extent's aspect ratio rarely matches `columns / rows` exactly.
+This is the core of the "correctly-shaped cells" requirement. Given a fixed `rows x columns` grid, the DEM's real-world extent (`width * xres`, `height * yres`) generally won't divide into that many cells of the target shape — the extent's aspect ratio rarely lines up exactly.
 
-The fix: pick the largest square cell side (`cell_size`) that fits within *both* axes —
+`cell_aspect` is the target cell's `width / height` ratio. The default, `1.0`, means square cells. Any other value produces rectangular cells with that ratio — e.g. for a physical grid whose pegs/pins are spaced 1.75in apart along the rows and 2.5in apart along the columns, `cell_aspect = 2.5 / 1.75 ≈ 1.4286` (only the *ratio* between the two spacings matters, not their absolute unit).
+
+The fix: pick the largest cell height that fits *both* axes at the target aspect ratio —
 
 ```python
-cell_size = min(real_width / columns, real_height / rows)
+cell_height = min(real_height / rows, real_width / (cell_aspect * columns))
+cell_width = cell_height * cell_aspect
 ```
 
-— then compute how many source pixels that implies along each axis (`cell_size * columns / xres` and `cell_size * rows / yres`), and **center-crop** the DEM down to exactly that many pixels, discarding any excess margin evenly from both sides of the longer axis. The result: every one of the `rows x columns` cells covers an equal-area square on the ground.
+— then compute how many source pixels that implies along each axis (`cell_width * columns / xres` and `cell_height * rows / yres`), and **center-crop** the DEM down to exactly that many pixels, discarding any excess margin evenly from both sides of the longer axis. The result: every one of the `rows x columns` cells covers an equal-shaped patch of ground, at the requested aspect ratio.
 
-Returns the cropped array, the resulting cell side length (in CRS units), and the pixel offset of the crop within the original (uncropped) band — the offset is needed later to draw the crop boundary on a preview of the full DEM.
+Returns the cropped array, the resulting cell width and height (in CRS units), and the pixel offset of the crop within the original (uncropped) band — the offset is needed later to draw the crop boundary on a preview of the full DEM.
 
-**Caveat:** if the DEM's CRS is geographic (degrees), "square" here means square in *degrees*, not true ground meters, since a degree of longitude covers a different ground distance than a degree of latitude (except at the equator). `main()` prints a warning in this case. For physically accurate squares, reproject the DEM to a projected CRS first (e.g. `gdalwarp -t_srs EPSG:32633 in.tif out.tif`).
+**Caveat:** if the DEM's CRS is geographic (degrees), cell dimensions are in *degrees*, not true ground meters, since a degree of longitude covers a different ground distance than a degree of latitude (except at the equator). `main()` prints a warning in this case. For physically accurate cell dimensions, reproject the DEM to a projected CRS first (e.g. `gdalwarp -t_srs EPSG:32633 in.tif out.tif`).
+
+`main()` derives `cell_aspect` from the `--row-spacing`/`--col-spacing` CLI flags (`cell_aspect = col_spacing / row_spacing`) when both are given, defaulting to `1.0` (square) otherwise. `validate_args` requires the two flags to be given together and both positive.
 
 ### `block_edges(source_size, num_blocks) -> np.ndarray`
 
@@ -98,7 +103,7 @@ Write the grid to disk. CSV: one row per line, values to 4 decimal places, `NaN`
 
 ### `export_cropped_texture(background, background_transform, dem_transform, crop_row_start, crop_col_start, crop_height, crop_width, path)`
 
-Crops a background image (`--preview-image`, or the DEM itself as a fallback) down to exactly the square footprint that `crop_to_square_cells` computed for the grid, and saves it as a plain `.png`/`.jpg`/`.jpeg` — no geospatial metadata, just pixels. The intent is a texture asset that a renderer can lay over the physical model in exact alignment with the height grid, since both were cropped to the same real-world square.
+Crops a background image (`--preview-image`, or the DEM itself as a fallback) down to exactly the footprint that `crop_to_fixed_aspect_cells` computed for the grid, and saves it as a plain `.png`/`.jpg`/`.jpeg` — no geospatial metadata, just pixels. The intent is a texture asset that a renderer can lay over the physical model in exact alignment with the height grid, since both were cropped to the same real-world region.
 
 Uses the same `dem_px_to_bg_px` coordinate conversion as `save_preview` (DEM pixel → world via `dem_transform` → background pixel via the inverse of `background_transform`) to convert the crop's four corners into the background image's pixel space, then takes the axis-aligned bounding box of those corners, clamped to the background image's actual bounds, and slices it out with plain NumPy indexing. Raises `ValueError` if that bounding box is empty (e.g. the DEM and background don't actually overlap in world coordinates — likely a CRS mismatch or unrelated images).
 
@@ -109,13 +114,13 @@ Written with `matplotlib.pyplot.imsave`: 2D (grayscale DEM fallback) arrays are 
 Renders a PNG/JPG/PDF/SVG (matplotlib, `Agg` backend — no display required) showing:
 
 - the background image (the DEM itself in grayscale, or a `--preview-image` raster in its natural colors)
-- a red polygon marking the crop boundary computed by `crop_to_square_cells`
+- a red polygon marking the crop boundary computed by `crop_to_fixed_aspect_cells`
 - each grid cell drawn as a semi-transparent, `viridis`-colored polygon (color = its remapped height, via `Normalize(target_min, target_max)`), outlined in yellow
 - the cell's rounded value as centered text (white with a black outline, for legibility over any background color)
 - cells that are `NaN` are hatched instead of colored
 - a colorbar keyed to the same `Normalize` range, labeled with `--units`
 
-**Coordinate alignment.** The crop boundary and grid cell edges are computed in the *DEM's* pixel space (from `crop_to_square_cells` and `block_edges`). To draw them on a background image that may have a different resolution, extent, or pixel grid (e.g. an orthophoto covering a larger or differently-sampled area), each DEM pixel coordinate is converted to world coordinates via the DEM's affine transform, then to the background image's pixel space via the *inverse* of the background's affine transform:
+**Coordinate alignment.** The crop boundary and grid cell edges are computed in the *DEM's* pixel space (from `crop_to_fixed_aspect_cells` and `block_edges`). To draw them on a background image that may have a different resolution, extent, or pixel grid (e.g. an orthophoto covering a larger or differently-sampled area), each DEM pixel coordinate is converted to world coordinates via the DEM's affine transform, then to the background image's pixel space via the *inverse* of the background's affine transform:
 
 ```python
 def dem_px_to_bg_px(col, row):
@@ -134,12 +139,13 @@ This only produces a correct overlay if the DEM and the background image share t
 | `--columns` | yes | Number of output grid columns |
 | `--target-min` / `--target-max` | yes | Output height range (e.g. `0` / `300` for mm) |
 | `--source-min` / `--source-max` | no | Fix the source elevation range instead of auto-detecting from the DEM; must be given together |
+| `--row-spacing` / `--col-spacing` | no | Physical pitch along each axis (any consistent unit); sets `cell_aspect = col_spacing / row_spacing` for rectangular cells instead of square. Must be given together, both positive |
 | `--output` | no | Save the grid to `.csv` or `.json` |
 | `--round-to` | no | Snap remapped values to the nearest multiple of this number |
 | `--preview` | no | Save a `.png`/`.jpg`/`.jpeg`/`.pdf`/`.svg` visualization of the grid |
 | `--preview-image` | no | Use a different georeferenced raster as the preview background instead of the DEM (same CRS required); also used as the source for `--export-texture` |
 | `--units` | no | Unit label for `--preview` cell text/colorbar (default `mm`; pass `""` for none) |
-| `--export-texture` | no | Save a `.png`/`.jpg`/`.jpeg` crop of `--preview-image` (or the DEM) matching the grid's square footprint exactly |
+| `--export-texture` | no | Save a `.png`/`.jpg`/`.jpeg` crop of `--preview-image` (or the DEM) matching the grid's crop footprint exactly |
 
 All validation happens up front in `validate_args` before any raster I/O, so bad arguments fail fast with a specific message (e.g. `--rows and --columns must be positive integers`, `--source-min and --source-max must be provided together`).
 
@@ -149,6 +155,7 @@ All validation happens up front in `validate_args` before any raster I/O, so bad
 
 ## Known limitations
 
-- Square-cell sizing assumes the CRS's linear units are consistent across both axes; for geographic CRSs a warning is printed but the script still proceeds using degree-based squares (see `crop_to_square_cells` above).
+- Cell sizing assumes the CRS's linear units are consistent across both axes; for geographic CRSs a warning is printed but the script still proceeds using degree-based cell dimensions (see `crop_to_fixed_aspect_cells` above).
 - `--preview-image` alignment assumes both rasters share the same CRS; there's no reprojection step, so mismatched CRSs will silently misalign the overlay.
-- Center-cropping discards DEM margin outside the largest square-fitting extent; there's no option to pad instead of crop.
+- Center-cropping discards DEM margin outside the largest cell-fitting extent; there's no option to pad instead of crop.
+- `--row-spacing`/`--col-spacing` only capture a single fixed aspect ratio; a physical grid with non-uniform pitch (spacing that varies cell-to-cell) isn't representable.

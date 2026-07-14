@@ -43,37 +43,44 @@ def read_display_image(path: Path) -> tuple[np.ndarray, "rasterio.Affine"]:
     return arr, transform
 
 
-def crop_to_square_cells(
-    band: np.ma.MaskedArray, xres: float, yres: float, rows: int, columns: int
-) -> tuple[np.ma.MaskedArray, float, int, int]:
+def crop_to_fixed_aspect_cells(
+    band: np.ma.MaskedArray, xres: float, yres: float, rows: int, columns: int, cell_aspect: float = 1.0
+) -> tuple[np.ma.MaskedArray, float, float, int, int]:
     """Center-crop the DEM so its extent divides exactly into (rows x columns)
-    real-world square cells.
+    real-world cells of a fixed aspect ratio (cell_width / cell_height).
 
     The physical display grid (rows x columns) is fixed, but the source DEM's
-    pixel resolution and aspect ratio can vary. To keep every output cell a
-    true square on the ground (not a rectangle stretched to fit), we pick the
-    largest square cell size that fits within the DEM's real-world extent,
-    then crop off any excess margin evenly from both sides of the longer axis.
+    pixel resolution and aspect ratio can vary. To keep every output cell the
+    correct real-world shape (not a rectangle stretched to fit), we pick the
+    largest cell height that fits within the DEM's real-world extent given the
+    target cell_aspect, then crop off any excess margin evenly from both sides
+    of the longer axis. cell_aspect=1.0 (the default) means square cells; any
+    other value produces rectangular cells with that width:height ratio, e.g.
+    for a physical grid whose row and column pitches differ (like PVC pipes
+    spaced 1.75in apart on one axis and 2.5in on the other: cell_aspect =
+    2.5 / 1.75).
 
-    Returns the cropped array, the cell side length, and the (row, column)
-    pixel offset of the crop within the original band (needed to draw the
-    crop boundary on a preview of the full, uncropped DEM).
+    Returns the cropped array, the cell width and height (in CRS units), and
+    the (row, column) pixel offset of the crop within the original band
+    (needed to draw the crop boundary on a preview of the full, uncropped
+    DEM).
     """
     height, width = band.shape
     real_width = width * xres
     real_height = height * yres
 
-    # Largest square cell side that fits both axes without exceeding the DEM extent.
-    cell_size = min(real_width / columns, real_height / rows)
+    # Largest cell height that fits both axes (at the given aspect) without exceeding the DEM extent.
+    cell_height = min(real_height / rows, real_width / (cell_aspect * columns))
+    cell_width = cell_height * cell_aspect
 
-    crop_width_px = min(width, int(round(cell_size * columns / xres)))
-    crop_height_px = min(height, int(round(cell_size * rows / yres)))
+    crop_width_px = min(width, int(round(cell_width * columns / xres)))
+    crop_height_px = min(height, int(round(cell_height * rows / yres)))
 
     col_start = (width - crop_width_px) // 2
     row_start = (height - crop_height_px) // 2
 
     cropped = band[row_start : row_start + crop_height_px, col_start : col_start + crop_width_px]
-    return cropped, cell_size, row_start, col_start
+    return cropped, cell_width, cell_height, row_start, col_start
 
 
 def block_edges(source_size: int, num_blocks: int) -> np.ndarray:
@@ -184,10 +191,10 @@ def export_cropped_texture(
     path: Path,
 ) -> None:
     """Crop a background image (an orthophoto from --preview-image, or the
-    DEM itself) down to exactly the square-cell footprint used for the grid
-    (as computed by crop_to_square_cells), and save it as a plain image file.
+    DEM itself) down to exactly the crop footprint used for the grid
+    (as computed by crop_to_fixed_aspect_cells), and save it as a plain image file.
 
-    This lets the same square region processed into the height grid also be
+    This lets the same region processed into the height grid also be
     exported as a texture, so a renderer can map the two onto the physical
     model in alignment. Like save_preview, coordinates are converted from the
     DEM's pixel space to the background image's pixel space via each
@@ -247,7 +254,7 @@ def save_preview(
     path: Path,
 ) -> None:
     """Render a background image (the DEM itself, or a different reference
-    image such as an orthophoto) with the square-cell grid overlaid: each
+    image such as an orthophoto) with the grid overlaid: each
     cell is tinted by a colormap based on its remapped height, labeled with
     its value, and a color-scale key is added, so the grid can be checked
     visually before running it on the physical platform.
@@ -342,7 +349,7 @@ def save_preview(
     label = f"Height ({units})" if units else "Height"
     fig.colorbar(sm, ax=ax, label=label, fraction=0.046, pad=0.04)
 
-    ax.set_title(f"{rows}x{columns} square-cell grid (red = crop boundary)")
+    ax.set_title(f"{rows}x{columns} grid (red = crop boundary)")
     ax.set_xlabel("column (px)")
     ax.set_ylabel("row (px)")
     fig.tight_layout()
@@ -359,6 +366,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--source-min and --source-max must be provided together")
     if args.source_min is not None and args.source_min >= args.source_max:
         raise ValueError("--source-min must be less than --source-max")
+    if (args.row_spacing is None) != (args.col_spacing is None):
+        raise ValueError("--row-spacing and --col-spacing must be provided together")
+    if args.row_spacing is not None and (args.row_spacing <= 0 or args.col_spacing <= 0):
+        raise ValueError("--row-spacing and --col-spacing must be positive numbers")
     if args.output is not None and args.output.suffix.lower() not in (".csv", ".json"):
         raise ValueError("--output must end in .csv or .json")
     if args.round_to is not None and args.round_to <= 0:
@@ -380,6 +391,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-max", type=float, required=True, help="Maximum output height")
     parser.add_argument("--source-min", type=float, default=None, help="Optional fixed minimum source elevation")
     parser.add_argument("--source-max", type=float, default=None, help="Optional fixed maximum source elevation")
+    parser.add_argument(
+        "--row-spacing",
+        type=float,
+        default=None,
+        help="Physical spacing between adjacent cells along the rows axis (any unit, e.g. "
+        "inches). Used with --col-spacing to make cells rectangular instead of square, "
+        "matching a real physical grid (e.g. unevenly-spaced pegs). Only the ratio between "
+        "the two matters. Must be given together with --col-spacing; omit both for square cells.",
+    )
+    parser.add_argument(
+        "--col-spacing",
+        type=float,
+        default=None,
+        help="Physical spacing between adjacent cells along the columns axis. See --row-spacing.",
+    )
     parser.add_argument("--output", type=Path, default=None, help="Optional output file path (.csv or .json)")
     parser.add_argument(
         "--round-to",
@@ -393,7 +419,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional image path (.png/.jpg/.pdf/.svg) to save a preview with the "
-        "square-cell crop boundary and grid overlaid",
+        "crop boundary and grid overlaid",
     )
     parser.add_argument(
         "--preview-image",
@@ -408,7 +434,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional image path (.png/.jpg/.jpeg) to save a cropped copy of --preview-image "
-        "(or the DEM itself, if not given) matching exactly the square-cell footprint used "
+        "(or the DEM itself, if not given) matching exactly the crop footprint used "
         "for the grid, for use as an aligned texture on the physical model",
     )
     parser.add_argument(
@@ -432,27 +458,35 @@ def main() -> None:
 
         band, xres, yres, is_geographic, dem_transform = read_dem(args.input)
 
+        cell_aspect = 1.0
+        if args.row_spacing is not None:
+            cell_aspect = args.col_spacing / args.row_spacing
+
         if is_geographic:
             print(
-                "Warning: DEM CRS is geographic (degrees) — square cells will be square "
-                "in degrees, not true real-world meters, since a degree of longitude and "
-                "a degree of latitude cover different ground distances. Reproject to a "
-                "projected (metric) CRS for physically accurate squares.",
+                "Warning: DEM CRS is geographic (degrees) — cells will be sized in degrees, "
+                "not true real-world meters, since a degree of longitude and a degree of "
+                "latitude cover different ground distances. Reproject to a projected "
+                "(metric) CRS for physically accurate cell dimensions.",
                 file=sys.stderr,
             )
 
         original_band = band
         original_shape = band.shape
-        band, cell_size, crop_row_start, crop_col_start = crop_to_square_cells(
-            band, xres, yres, args.rows, args.columns
+        band, cell_width, cell_height, crop_row_start, crop_col_start = crop_to_fixed_aspect_cells(
+            band, xres, yres, args.rows, args.columns, cell_aspect
         )
         unit = "deg" if is_geographic else "unit"
         if band.shape != original_shape:
+            shape_desc = (
+                f"square of side ~{cell_height:.6f} {unit}"
+                if cell_aspect == 1.0
+                else f"rectangle of ~{cell_height:.6f} (rows) x ~{cell_width:.6f} (columns) {unit}"
+            )
             print(
                 f"Cropped DEM from {original_shape[1]}x{original_shape[0]} to "
                 f"{band.shape[1]}x{band.shape[0]} pixels (centered) so each of the "
-                f"{args.rows}x{args.columns} cells is a real-world square of side "
-                f"~{cell_size:.6f} {unit}"
+                f"{args.rows}x{args.columns} cells is a real-world {shape_desc}"
             )
 
         source_min, source_max = determine_source_range(band, args.source_min, args.source_max)
